@@ -6,10 +6,11 @@ SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 Please see LICENSE in the repository root for full details.
 */
 
-import { type LivekitTransport } from "matrix-js-sdk/lib/matrixrtc";
-import { combineLatest, map, of, switchMap, tap } from "rxjs";
+import { type LivekitTransportConfig } from "matrix-js-sdk/lib/matrixrtc";
+import { combineLatest, map, of, switchMap } from "rxjs";
 import { type Logger } from "matrix-js-sdk/lib/logger";
 import { type RemoteParticipant } from "livekit-client";
+import { type CallMembershipIdentityParts } from "matrix-js-sdk/lib/matrixrtc/EncryptionManager";
 
 import { type Behavior } from "../../Behavior.ts";
 import { type Connection } from "./Connection.ts";
@@ -17,6 +18,11 @@ import { Epoch, type ObservableScope } from "../../ObservableScope.ts";
 import { generateItemsWithEpoch } from "../../../utils/observable.ts";
 import { areLivekitTransportsEqual } from "./MatrixLivekitMembers.ts";
 import { type ConnectionFactory } from "./ConnectionFactory.ts";
+import {
+  isLocalTransportWithSFUConfig,
+  type LocalTransportWithSFUConfig,
+} from "../localMember/LocalTransport.ts";
+import { type SFUConfig } from "../../../livekit/openIDSFU.ts";
 
 export class ConnectionManagerData {
   private readonly store: Map<
@@ -36,8 +42,10 @@ export class ConnectionManagerData {
     }
   }
 
-  private getKey(transport: LivekitTransport): string {
-    return transport.livekit_service_url + "|" + transport.livekit_alias;
+  private getKey(transport: LivekitTransportConfig): string {
+    // This is enough as a key because the ConnectionManager is already scoped by room.
+    // We also do not need to consider the slotId at this point since each `MatrixRTCSession` is already scoped by `slotDescription: {id, application}`.
+    return transport.livekit_service_url;
   }
 
   public getConnections(): Connection[] {
@@ -45,15 +53,15 @@ export class ConnectionManagerData {
   }
 
   public getConnectionForTransport(
-    transport: LivekitTransport,
+    transport: LivekitTransportConfig,
   ): Connection | null {
     return this.store.get(this.getKey(transport))?.connection ?? null;
   }
 
   public getParticipantsForTransport(
-    transport: LivekitTransport,
+    transport: LivekitTransportConfig,
   ): RemoteParticipant[] {
-    const key = transport.livekit_service_url + "|" + transport.livekit_alias;
+    const key = this.getKey(transport);
     const existing = this.store.get(key);
     if (existing) {
       return existing.participants;
@@ -65,8 +73,11 @@ export class ConnectionManagerData {
 interface Props {
   scope: ObservableScope;
   connectionFactory: ConnectionFactory;
-  inputTransports$: Behavior<Epoch<LivekitTransport[]>>;
+  localTransport$: Behavior<LocalTransportWithSFUConfig | null>;
+  remoteTransports$: Behavior<Epoch<LivekitTransportConfig[]>>;
+
   logger: Logger;
+  ownMembershipIdentity: CallMembershipIdentityParts;
 }
 
 // TODO - write test for scopes (do we really need to bind scope)
@@ -79,8 +90,12 @@ export interface IConnectionManager {
  * @param props - Configuration object
  * @param props.scope - The observable scope used by this object
  * @param props.connectionFactory - Used to create new connections
- * @param props.inputTransports$ - A list of Behaviors each containing a LIST of LivekitTransport.
- * @param props.logger - The logger to use
+ * @param props.localTransport$ - The transport to publish local media on. (deduplicated with remoteTransports$)
+ * @param props.remoteTransports$ - All other transports. The connection manager will create connections for each transport. (deduplicated with localTransport$)
+ * @param props.ownMembershipIdentity - The own membership identity to use.
+ * @param props.logger - The logger to use.
+
+ *
  *   Each of these behaviors can be interpreted as subscribed list of transports.
  *
  *   Using `registerTransports` independent external modules can control what connections
@@ -93,8 +108,10 @@ export interface IConnectionManager {
 export function createConnectionManager$({
   scope,
   connectionFactory,
-  inputTransports$,
+  localTransport$,
+  remoteTransports$,
   logger: parentLogger,
+  ownMembershipIdentity,
 }: Props): IConnectionManager {
   const logger = parentLogger.getChild("[ConnectionManager]");
   // TODO logger: only construct one logger from the client and make it compatible via a EC specific sing
@@ -107,12 +124,33 @@ export function createConnectionManager$({
    * It is build based on the list of subscribed transports (`transportsSubscriptions$`).
    * externally this is modified via `registerTransports()`.
    */
-  const transports$ = scope.behavior(
-    inputTransports$.pipe(
-      map((transports) => transports.mapInner(removeDuplicateTransports)),
-      tap(({ value: transports }) => {
-        logger.trace(
-          `Managing transports: ${transports.map((t) => t.livekit_service_url).join(", ")}`,
+  const localAndRemoteTransports$: Behavior<
+    Epoch<(LivekitTransportConfig | LocalTransportWithSFUConfig)[]>
+  > = scope.behavior(
+    combineLatest([remoteTransports$, localTransport$]).pipe(
+      // Combine local and remote transports into one transport array
+      // and set the forceOldJwtEndpoint property on the local transport
+      map(([remoteTransports, localTransport]) => {
+        let localTransportAsArray: LocalTransportWithSFUConfig[] = [];
+        if (localTransport) {
+          localTransportAsArray = [localTransport];
+        }
+        const dedupedRemote = removeDuplicateTransports(remoteTransports.value);
+        const remoteWithoutLocal = dedupedRemote.filter(
+          (transport) =>
+            !localTransportAsArray.find((l) =>
+              areLivekitTransportsEqual(l.transport, transport),
+            ),
+        );
+        logger.debug(
+          "remoteWithoutLocal",
+          remoteWithoutLocal,
+          "localTransportAsArray",
+          localTransportAsArray,
+        );
+        return new Epoch(
+          [...localTransportAsArray, ...remoteWithoutLocal],
+          remoteTransports.epoch,
         );
       }),
     ),
@@ -122,25 +160,43 @@ export function createConnectionManager$({
    * Connections for each transport in use by one or more session members.
    */
   const connections$ = scope.behavior(
-    transports$.pipe(
+    localAndRemoteTransports$.pipe(
       generateItemsWithEpoch(
+        "ConnectionManager connections$",
         function* (transports) {
-          for (const transport of transports)
-            yield {
-              keys: [transport.livekit_service_url, transport.livekit_alias],
-              data: undefined,
-            };
+          for (const transport of transports) {
+            if (isLocalTransportWithSFUConfig(transport)) {
+              // This is the local transport; only the `LocalTransportWithSFUConfig` has a `sfuConfig` field.
+              yield {
+                keys: [
+                  transport.transport.livekit_service_url,
+                  transport.sfuConfig,
+                ],
+                data: undefined,
+              };
+            } else {
+              yield {
+                keys: [
+                  transport.livekit_service_url,
+                  undefined as SFUConfig | undefined,
+                ],
+                data: undefined,
+              };
+            }
+          }
         },
-        (scope, _data$, serviceUrl, alias) => {
-          logger.debug(`Creating connection to ${serviceUrl} (${alias})`);
+        (scope, _data$, serviceUrl, sfuConfig) => {
           const connection = connectionFactory.createConnection(
+            scope,
             {
               type: "livekit",
               livekit_service_url: serviceUrl,
-              livekit_alias: alias,
             },
-            scope,
+            ownMembershipIdentity,
             logger,
+            // TODO: This whole optional SFUConfig parameter is not particularly elegant.
+            // I would like it if connections always fetched the SFUConfig by themselves.
+            sfuConfig,
           );
           // Start the connection immediately
           // Use connection state to track connection progress
@@ -190,18 +246,18 @@ export function createConnectionManager$({
         );
       }),
     ),
-    new Epoch(new ConnectionManagerData()),
+    new Epoch(new ConnectionManagerData(), -1),
   );
 
   return { connectionManagerData$ };
 }
 
-function removeDuplicateTransports(
-  transports: LivekitTransport[],
-): LivekitTransport[] {
+function removeDuplicateTransports<T extends LivekitTransportConfig>(
+  transports: T[],
+): T[] {
   return transports.reduce((acc, transport) => {
     if (!acc.some((t) => areLivekitTransportsEqual(t, transport)))
       acc.push(transport);
     return acc;
-  }, [] as LivekitTransport[]);
+  }, [] as T[]);
 }

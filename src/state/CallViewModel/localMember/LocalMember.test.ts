@@ -8,7 +8,7 @@ Please see LICENSE in the repository root for full details.
 
 import {
   Status as RTCMemberStatus,
-  type LivekitTransport,
+  type LivekitTransportConfig,
   type MatrixRTCSession,
 } from "matrix-js-sdk/lib/matrixrtc";
 import { describe, expect, it, vi } from "vitest";
@@ -24,6 +24,7 @@ import {
   mockLivekitRoom,
   mockMuteStates,
   withTestScheduler,
+  ownMemberMock,
 } from "../../../utils/test";
 import {
   TransportState,
@@ -38,6 +39,9 @@ import { constant } from "../../Behavior";
 import { ConnectionManagerData } from "../remoteMembers/ConnectionManager";
 import { ConnectionState, type Connection } from "../remoteMembers/Connection";
 import { type Publisher } from "./Publisher";
+import { initializeWidget } from "../../../widget";
+
+initializeWidget();
 
 const MATRIX_RTC_MODE = MatrixRTCMode.Legacy;
 const getUrlParams = vi.hoisted(() => vi.fn(() => ({})));
@@ -103,11 +107,12 @@ describe("LocalMembership", () => {
         getOldestMembership: vi.fn().mockReturnValue({
           getPreferredFoci: vi.fn().mockReturnValue([focusFromOlderMembership]),
         }),
-        joinRoomSession: vi.fn(),
+        joinRTCSession: vi.fn(),
       }) as unknown as MatrixRTCSession;
 
       enterRTCSession(
         mockedSession,
+        ownMemberMock,
         {
           livekit_alias: "roomId",
           livekit_service_url: "http://my-well-known-service-url.com",
@@ -119,7 +124,12 @@ describe("LocalMembership", () => {
         },
       );
 
-      expect(mockedSession.joinRoomSession).toHaveBeenLastCalledWith(
+      expect(mockedSession.joinRTCSession).toHaveBeenLastCalledWith(
+        {
+          deviceId: "DEVICE",
+          memberId: "@alice:example.org:DEVICE",
+          userId: "@alice:example.org",
+        },
         [
           {
             livekit_alias: "roomId",
@@ -161,11 +171,12 @@ describe("LocalMembership", () => {
         },
         memberships: [],
         getFocusInUse: vi.fn(),
-        joinRoomSession: vi.fn(),
+        joinRTCSession: vi.fn(),
       }) as unknown as MatrixRTCSession;
 
       enterRTCSession(
         mockedSession,
+        ownMemberMock,
         {
           livekit_alias: "roomId",
           livekit_service_url: "http://my-well-known-service-url.com",
@@ -185,8 +196,8 @@ describe("LocalMembership", () => {
       matrixRTCMode: MatrixRTCMode.Matrix_2_0,
     }),
     matrixRTCSession: {
-      updateCallIntent: () => {},
-      leaveRoomSession: () => {},
+      updateCallIntent: vi.fn().mockReturnValue(Promise.resolve()),
+      leaveRoomSession: vi.fn(),
     } as unknown as MatrixRTCSession,
     muteStates: mockMuteStates(),
     trackProcessorState$: constant({
@@ -204,7 +215,7 @@ describe("LocalMembership", () => {
 
   it("throws error on missing RTC config error", () => {
     withTestScheduler(({ scope, hot, expectObservable }) => {
-      const localTransport$ = scope.behavior<null | LivekitTransport>(
+      const localTransport$ = scope.behavior<null | LivekitTransportConfig>(
         hot("1ms #", {}, new MatrixRTCTransportMissingError("domain.com")),
         null,
       );
@@ -234,12 +245,43 @@ describe("LocalMembership", () => {
     });
   });
 
+  it("logs if callIntent cannot be updated", async () => {
+    const scope = new ObservableScope();
+
+    const localTransport$ = new BehaviorSubject(aTransport);
+    const mockConnectionManager = {
+      transports$: constant(new Epoch([])),
+      connectionManagerData$: constant(new Epoch(new ConnectionManagerData())),
+    };
+    async function reject(): Promise<void> {
+      return Promise.reject(new Error("Not connected yet"));
+    }
+    const localMembership = createLocalMembership$({
+      scope,
+      ...defaultCreateLocalMemberValues,
+      matrixRTCSession: {
+        updateCallIntent: vi.fn().mockImplementation(reject),
+        leaveRoomSession: vi.fn(),
+      },
+      connectionManager: mockConnectionManager,
+      localTransport$,
+    });
+    const expextedLog =
+      "'not connected yet' while updating the call intent (this is expected on startup)";
+    const internalLogger = vi.spyOn(localMembership.internalLoggerRef, "debug");
+
+    await flushPromises();
+    defaultCreateLocalMemberValues.muteStates.video.setEnabled$.value?.(true);
+    expect(internalLogger).toHaveBeenCalledWith(expextedLog);
+    scope.end();
+  });
+
   const aTransport = {
     livekit_service_url: "a",
-  } as LivekitTransport;
+  } as LivekitTransportConfig;
   const bTransport = {
     livekit_service_url: "b",
-  } as LivekitTransport;
+  } as LivekitTransportConfig;
 
   const connectionTransportAConnected = {
     livekitRoom: mockLivekitRoom({
@@ -262,7 +304,7 @@ describe("LocalMembership", () => {
     livekitRoom: mockLivekitRoom({}),
   } as unknown as Connection;
 
-  it("recreates publisher if new connection is used and ENDS always unpublish and end tracks", async () => {
+  it("recreates publisher if new connection is used, always unpublish and end tracks", async () => {
     const scope = new ObservableScope();
 
     const localTransport$ = new BehaviorSubject(aTransport);
@@ -275,6 +317,9 @@ describe("LocalMembership", () => {
         seed += 1;
         logger.info(`creating [${a}]`);
         const p = {
+          // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
+          // all the cleanup we need.
+          destroy: vi.fn(),
           stopPublishing: vi.fn().mockImplementation(() => {
             logger.info(`stopPublishing [${a}]`);
           }),
@@ -303,19 +348,18 @@ describe("LocalMembership", () => {
     await flushPromises();
     localTransport$.next(bTransport);
     await flushPromises();
+
     expect(publisherFactory).toHaveBeenCalledTimes(2);
     expect(publishers.length).toBe(2);
     // stop the first Publisher and let the second one life.
-    expect(publishers[0].stopTracks).toHaveBeenCalled();
-    expect(publishers[1].stopTracks).not.toHaveBeenCalled();
-    expect(publishers[0].stopPublishing).toHaveBeenCalled();
-    expect(publishers[1].stopPublishing).not.toHaveBeenCalled();
+    expect(publishers[0].destroy).toHaveBeenCalled();
+    expect(publishers[1].destroy).not.toHaveBeenCalled();
     expect(publisherFactory.mock.calls[0][0].transport).toBe(aTransport);
     expect(publisherFactory.mock.calls[1][0].transport).toBe(bTransport);
     scope.end();
     await flushPromises();
     // stop all tracks after ending scopes
-    expect(publishers[1].stopPublishing).toHaveBeenCalled();
+    expect(publishers[1].destroy).toHaveBeenCalled();
     // expect(publishers[1].stopTracks).toHaveBeenCalled();
 
     defaultCreateLocalMemberValues.createPublisherFactory.mockReset();
@@ -333,8 +377,9 @@ describe("LocalMembership", () => {
     defaultCreateLocalMemberValues.createPublisherFactory.mockImplementation(
       () => {
         const p = {
-          stopPublishing: vi.fn(),
-          stopTracks: vi.fn(),
+          // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
+          // all the cleanup we need.
+          destroy: vi.fn(),
           createAndSetupTracks: vi.fn().mockImplementation(async () => {
             tracks$.next([{}, {}] as LocalTrack[]);
             return Promise.resolve();
@@ -369,11 +414,11 @@ describe("LocalMembership", () => {
     localMembership.startTracks();
     await flushPromises();
     expect(publishers[0].createAndSetupTracks).toHaveBeenCalled();
-    // expect(localMembership.tracks$.value.length).toBe(2);
+
     scope.end();
     await flushPromises();
     // stop all tracks after ending scopes
-    expect(publishers[0].stopPublishing).toHaveBeenCalled();
+    expect(publishers[0].destroy).toHaveBeenCalled();
     // expect(publishers[0].stopTracks).toHaveBeenCalled();
     publisherFactory.mockClear();
   });
@@ -383,33 +428,30 @@ describe("LocalMembership", () => {
     const scope = new ObservableScope();
 
     const connectionManagerData = new ConnectionManagerData();
-    const localTransport$ = new BehaviorSubject<null | LivekitTransport>(null);
+    const localTransport$ = new BehaviorSubject<null | LivekitTransportConfig>(
+      null,
+    );
     const connectionManagerData$ = new BehaviorSubject(
       new Epoch(connectionManagerData),
     );
     const publishers: Publisher[] = [];
 
-    const tracks$ = new BehaviorSubject<LocalTrack[]>([]);
     const publishing$ = new BehaviorSubject<boolean>(false);
     const createTrackResolver = Promise.withResolvers<void>();
     const publishResolver = Promise.withResolvers<void>();
     defaultCreateLocalMemberValues.createPublisherFactory.mockImplementation(
       () => {
         const p = {
-          stopPublishing: vi.fn(),
-          stopTracks: vi.fn().mockImplementation(() => {
-            logger.info("stopTracks");
-            tracks$.next([]);
-          }),
+          // It is enought to check if destroy is called. Destroy itself is tested in the publisher to make sure it does
+          // all the cleanup we need.
+          destroy: vi.fn(),
           createAndSetupTracks: vi.fn().mockImplementation(async () => {
             await createTrackResolver.promise;
-            tracks$.next([{}, {}] as LocalTrack[]);
           }),
           startPublishing: vi.fn().mockImplementation(async () => {
             await publishResolver.promise;
             publishing$.next(true);
           }),
-          tracks$,
           publishing$,
         };
         publishers.push(p as unknown as Publisher);
@@ -509,7 +551,7 @@ describe("LocalMembership", () => {
       (localMembership.localMemberState$.value as any).media,
     ).toStrictEqual(PublishState.Publishing);
 
-    expect(publishers[0].stopPublishing).not.toHaveBeenCalled();
+    expect(publishers[0].destroy).not.toHaveBeenCalled();
 
     expect(localMembership.localMemberState$.isStopped).toBe(false);
     scope.end();
@@ -520,7 +562,7 @@ describe("LocalMembership", () => {
       (localMembership.localMemberState$.value as any).media,
     ).toStrictEqual(PublishState.Publishing);
     // stop all tracks after ending scopes
-    expect(publishers[0].stopPublishing).toHaveBeenCalled();
+    expect(publishers[0].destroy).toHaveBeenCalled();
     // expect(publishers[0].stopTracks).toHaveBeenCalled();
   });
   // TODO add tests for matrix local matrix participation.

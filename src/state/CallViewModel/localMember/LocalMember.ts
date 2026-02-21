@@ -18,6 +18,7 @@ import { observeParticipantEvents } from "@livekit/components-core";
 import {
   Status as RTCSessionStatus,
   type LivekitTransport,
+  type LivekitTransportConfig,
   type MatrixRTCSession,
 } from "matrix-js-sdk/lib/matrixrtc";
 import {
@@ -37,6 +38,7 @@ import {
 } from "rxjs";
 import { type Logger } from "matrix-js-sdk/lib/logger";
 import { deepCompare } from "matrix-js-sdk/lib/utils";
+import { type CallMembershipIdentityParts } from "matrix-js-sdk/lib/matrixrtc/EncryptionManager";
 
 import { type Behavior } from "../../Behavior.ts";
 import { type IConnectionManager } from "../remoteMembers/ConnectionManager.ts";
@@ -124,9 +126,9 @@ interface Props {
   muteStates: MuteStates;
   connectionManager: IConnectionManager;
   createPublisherFactory: (connection: Connection) => Publisher;
-  joinMatrixRTC: (transport: LivekitTransport) => void;
+  joinMatrixRTC: (transport: LivekitTransportConfig) => void;
   homeserverConnected: HomeserverConnected;
-  localTransport$: Behavior<LivekitTransport | null>;
+  localTransport$: Behavior<LivekitTransportConfig | null>;
   matrixRTCSession: Pick<
     MatrixRTCSession,
     "updateCallIntent" | "leaveRoomSession"
@@ -145,7 +147,7 @@ interface Props {
  * @param props.createPublisherFactory Factory to create a publisher once we have a connection.
  * @param props.joinMatrixRTC Callback to join the matrix RTC session once we have a transport.
  * @param props.homeserverConnected The homeserver connected state.
- * @param props.localTransport$ The local transport to use for publishing.
+ * @param props.localTransport$ The transport to advertise in our membership.
  * @param props.logger The logger to use.
  * @param props.muteStates The mute states for video and audio.
  * @param props.matrixRTCSession The matrix RTC session to join.
@@ -199,6 +201,7 @@ export const createLocalMembership$ = ({
    * Fully connected
    */
   connected$: Behavior<boolean>;
+  internalLoggerRef: Logger;
 } => {
   const logger = parentLogger.getChild("[LocalMembership]");
   logger.debug(`Creating local membership..`);
@@ -263,11 +266,11 @@ export const createLocalMembership$ = ({
 
   mediaErrors$.pipe(scope.bind()).subscribe((error) => {
     if (error) {
+      // This is a MediaDevice error, can be PermissionDenied, NotFound, DeviceInUse, Other.
+      // Will also occurs if you cancel screen sharing browser prompt.
+      // This is not necessarily fatal, since the user might be able to join without media.
+      // XXX We might want to give some user feedback here to let them know their media is not working.
       logger.error(`Failed to create local tracks:`, error);
-      setMatrixError(
-        // TODO is it fatal? Do we need to create a new Specialized Error?
-        new UnknownCallError(new Error(`Media device error: ${error}`)),
-      );
     }
   });
   // MATRIX RELATED
@@ -307,13 +310,17 @@ export const createLocalMembership$ = ({
   //  - destruct all current streams
   //  - overwrite current publisher
   scope.reconcile(localConnection$, async (connection) => {
+    logger.info(
+      "reconcile based on new localConnection:",
+      connection?.transport.livekit_service_url,
+    );
     if (connection !== null) {
       const publisher = createPublisherFactory(connection);
       publisher$.next(publisher);
+
       // Clean-up callback
       return Promise.resolve(async (): Promise<void> => {
-        await publisher.stopPublishing();
-        await publisher.stopTracks();
+        await publisher.destroy();
       });
     }
   });
@@ -517,12 +524,19 @@ export const createLocalMembership$ = ({
       }
     });
 
-  combineLatest([muteStates.video.enabled$, homeserverConnected.combined$])
-    .pipe(scope.bind())
-    .subscribe(([videoEnabled, connected]) => {
-      if (!connected) return;
-      void matrixRTCSession.updateCallIntent(videoEnabled ? "video" : "audio");
-    });
+  muteStates.video.enabled$.pipe(scope.bind()).subscribe((videoEnabled) => {
+    void matrixRTCSession
+      .updateCallIntent(videoEnabled ? "video" : "audio")
+      .catch((e) => {
+        if (e instanceof Error && e.message === "Not connected yet") {
+          logger.debug(
+            "'not connected yet' while updating the call intent (this is expected on startup)",
+          );
+        } else {
+          throw e;
+        }
+      });
+  });
 
   // Keep matrix rtc session in sync with localTransport$, connectRequested$
   scope.reconcile(
@@ -552,7 +566,12 @@ export const createLocalMembership$ = ({
   );
 
   const participant$ = scope.behavior(
-    localConnection$.pipe(map((c) => c?.livekitRoom?.localParticipant ?? null)),
+    localConnection$.pipe(
+      map((c) => c?.livekitRoom?.localParticipant ?? null),
+      tap((p) => {
+        logger.debug("participant$ updated:", p?.identity);
+      }),
+    ),
   );
 
   // Pause upstream of all local media tracks when we're disconnected from
@@ -700,6 +719,7 @@ export const createLocalMembership$ = ({
     sharingScreen$,
     toggleScreenSharing,
     connection$: localConnection$,
+    internalLoggerRef: logger,
   };
 };
 
@@ -726,18 +746,19 @@ interface EnterRTCSessionOptions {
  *      - Handles retries (fails only after several attempts)
  *
  * @param rtcSession - The MatrixRTCSession to join.
+ * @param ownMembershipIdentity - Options for entering the RTC session.
  * @param transport - The LivekitTransport to use for this session.
- * @param options - Options for entering the RTC session.
- * @param options.encryptMedia - Whether to encrypt media.
- * @param options.matrixRTCMode - The Matrix RTC mode to use.
+ * @param options - `encryptMedia`: Whether to encrypt media `matrixRTCMode`: The Matrix RTC mode to use.
  * @throws If the widget could not send ElementWidgetActions.JoinCall action.
  */
 // Exported for unit testing
 export function enterRTCSession(
   rtcSession: MatrixRTCSession,
-  transport: LivekitTransport,
-  { encryptMedia, matrixRTCMode }: EnterRTCSessionOptions,
+  ownMembershipIdentity: CallMembershipIdentityParts,
+  transport: LivekitTransportConfig,
+  options: EnterRTCSessionOptions,
 ): void {
+  const { encryptMedia, matrixRTCMode } = options;
   PosthogAnalytics.instance.eventCallEnded.cacheStartCall(new Date());
   PosthogAnalytics.instance.eventCallStarted.track(rtcSession.room.roomId);
 
@@ -749,12 +770,29 @@ export function enterRTCSession(
   const useDeviceSessionMemberEvents =
     features?.feature_use_device_session_member_events;
   const { sendNotificationType: notificationType, callIntent } = getUrlParams();
-  const multiSFU = matrixRTCMode !== MatrixRTCMode.Legacy;
+  const multiSFU =
+    matrixRTCMode === MatrixRTCMode.Compatibility ||
+    matrixRTCMode === MatrixRTCMode.Matrix_2_0;
+
+  // For backwards compatibility with Element Call versions that do not do Matrix 2.0,
+  // we add the livekit alias to the transport.
+  let backwardCompatibleTransport: LivekitTransport | LivekitTransportConfig;
+  if (matrixRTCMode === MatrixRTCMode.Matrix_2_0) {
+    backwardCompatibleTransport = transport;
+  } else {
+    backwardCompatibleTransport = {
+      livekit_alias: rtcSession.room.roomId,
+      ...transport,
+    };
+  }
+
   // Multi-sfu does not need a preferred foci list. just the focus that is actually used.
   // TODO where/how do we track errors originating from the ongoing rtcSession?
-  rtcSession.joinRoomSession(
-    multiSFU ? [] : [transport],
-    multiSFU ? transport : undefined,
+
+  rtcSession.joinRTCSession(
+    ownMembershipIdentity,
+    multiSFU ? [] : [backwardCompatibleTransport],
+    multiSFU ? backwardCompatibleTransport : undefined,
     {
       notificationType,
       callIntent,

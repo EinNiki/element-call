@@ -29,7 +29,6 @@ import {
   Status,
   type CallMembership,
   type IRTCNotificationContent,
-  type ICallNotifyContent,
   MatrixRTCSessionEvent,
   type LivekitTransport,
 } from "matrix-js-sdk/lib/matrixrtc";
@@ -62,6 +61,9 @@ import { getValue } from "../../utils/observable.ts";
 import { type Behavior, constant } from "../Behavior.ts";
 import { withCallViewModel as withCallViewModelInMode } from "./CallViewModelTestUtils.ts";
 import { MatrixRTCMode } from "../../settings/settings.ts";
+import { initializeWidget } from "../../widget.ts";
+
+initializeWidget();
 
 vi.mock("rxjs", async (importOriginal) => ({
   ...(await importOriginal()),
@@ -78,11 +80,14 @@ vi.mock("../e2ee/matrixKeyProvider");
 const getUrlParams = vi.hoisted(() => vi.fn(() => ({})));
 vi.mock("../UrlParams", () => ({ getUrlParams }));
 
-vi.mock("../rtcSessionHelpers", async (importOriginal) => ({
-  ...(await importOriginal()),
-  makeTransport: async (): Promise<LivekitTransport> =>
-    Promise.resolve(exampleTransport),
-}));
+vi.mock(
+  "../state/CallViewModel/localMember/localTransport",
+  async (importOriginal) => ({
+    ...(await importOriginal()),
+    makeTransport: async (): Promise<LivekitTransport> =>
+      Promise.resolve(exampleTransport),
+  }),
+);
 
 const yesNo = {
   y: true,
@@ -226,13 +231,9 @@ function mockRingEvent(
   } as unknown as { event_id: string } & IRTCNotificationContent;
 }
 
-// The app doesn't really care about the content of these legacy events, we just
-// need a value to fill in for them when emitting notifications
-const mockLegacyRingEvent = {} as { event_id: string } & ICallNotifyContent;
-
 describe.each([
   [MatrixRTCMode.Legacy],
-  [MatrixRTCMode.Compatibil],
+  [MatrixRTCMode.Compatibility],
   [MatrixRTCMode.Matrix_2_0],
 ])("CallViewModel (%s mode)", (mode) => {
   const withCallViewModel = withCallViewModelInMode(mode);
@@ -1103,7 +1104,6 @@ describe.each([
                 rtcSession.emit(
                   MatrixRTCSessionEvent.DidSendCallNotification,
                   mockRingEvent("$notif1", 30),
-                  mockLegacyRingEvent,
                 );
               },
             });
@@ -1145,7 +1145,6 @@ describe.each([
                 rtcSession.emit(
                   MatrixRTCSessionEvent.DidSendCallNotification,
                   mockRingEvent("$notif2", 100),
-                  mockLegacyRingEvent,
                 );
               },
               d: () => {
@@ -1254,11 +1253,6 @@ describe.each([
           schedule(membershipStatusMarbles, {
             y: () => {
               rtcSession.membershipStatus = Status.Connected;
-            },
-            n: () => {
-              // NOTE: This was removed in https://github.com/matrix-org/matrix-js-sdk/pull/5103 accidentally.
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              rtcSession.membershipStatus = "Reconnecting" as any;
             },
           });
           schedule(probablyLeftMarbles, {

@@ -33,7 +33,6 @@ import { useTranslation } from "react-i18next";
 
 import LogoMark from "../icons/LogoMark.svg?react";
 import LogoType from "../icons/LogoType.svg?react";
-import type { IWidgetApiRequest } from "matrix-widget-api";
 import {
   EndCallButton,
   MicButton,
@@ -45,7 +44,7 @@ import {
 import { Header, LeftNav, RightNav, RoomHeaderInfo } from "../Header";
 import { type HeaderStyle, useUrlParams } from "../UrlParams";
 import { useCallViewKeyboardShortcuts } from "../useCallViewKeyboardShortcuts";
-import { ElementWidgetActions, widget } from "../widget";
+import { widget } from "../widget";
 import styles from "./InCallView.module.css";
 import { GridTile } from "../tile/GridTile";
 import { SettingsModal, defaultSettingsTab } from "../settings/SettingsModal";
@@ -445,46 +444,6 @@ export const InCallView: FC<InCallViewProps> = ({
     [vm],
   );
 
-  useEffect(() => {
-    widget?.api.transport
-      .send(
-        gridMode === "grid"
-          ? ElementWidgetActions.TileLayout
-          : ElementWidgetActions.SpotlightLayout,
-        {},
-      )
-      .catch((e) => {
-        logger.error("Failed to send layout change to widget API", e);
-      });
-  }, [gridMode]);
-
-  useEffect(() => {
-    if (widget) {
-      const onTileLayout = (ev: CustomEvent<IWidgetApiRequest>): void => {
-        setGridMode("grid");
-        widget!.api.transport.reply(ev.detail, {});
-      };
-      const onSpotlightLayout = (ev: CustomEvent<IWidgetApiRequest>): void => {
-        setGridMode("spotlight");
-        widget!.api.transport.reply(ev.detail, {});
-      };
-
-      widget.lazyActions.on(ElementWidgetActions.TileLayout, onTileLayout);
-      widget.lazyActions.on(
-        ElementWidgetActions.SpotlightLayout,
-        onSpotlightLayout,
-      );
-
-      return (): void => {
-        widget!.lazyActions.off(ElementWidgetActions.TileLayout, onTileLayout);
-        widget!.lazyActions.off(
-          ElementWidgetActions.SpotlightLayout,
-          onSpotlightLayout,
-        );
-      };
-    }
-  }, [setGridMode]);
-
   useAppBarSecondaryButton(
     useMemo(() => {
       if (audioOutputSwitcher === null) return null;
@@ -816,6 +775,8 @@ export const InCallView: FC<InCallViewProps> = ({
     </div>
   );
 
+  const allConnections = useBehavior(vm.allConnections$);
+
   return (
     <div
       className={styles.inRoom}
@@ -854,8 +815,15 @@ export const InCallView: FC<InCallViewProps> = ({
             onDismiss={closeSettings}
             tab={settingsTab}
             onTabChange={setSettingsTab}
-            // TODO expose correct data to setttings modal
-            livekitRooms={[]}
+            livekitRooms={allConnections
+              .getConnections()
+              .map((connectionItem) => ({
+                room: connectionItem.livekitRoom,
+                livekitAlias: connectionItem.livekitAlias,
+                // TODO compute is local or tag it in the livekit room items already
+                isLocal: undefined,
+                url: connectionItem.transport.livekit_service_url,
+              }))}
           />
         </>
       )}

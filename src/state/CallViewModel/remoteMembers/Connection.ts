@@ -15,9 +15,10 @@ import {
   type Room as LivekitRoom,
   type RemoteParticipant,
 } from "livekit-client";
-import { type LivekitTransport } from "matrix-js-sdk/lib/matrixrtc";
+import { type LivekitTransportConfig } from "matrix-js-sdk/lib/matrixrtc";
 import { BehaviorSubject, map } from "rxjs";
 import { type Logger } from "matrix-js-sdk/lib/logger";
+import { type CallMembershipIdentityParts } from "matrix-js-sdk/lib/matrixrtc/EncryptionManager";
 
 import {
   getSFUConfigWithOpenID,
@@ -32,12 +33,27 @@ import {
   SFURoomCreationRestrictedError,
   UnknownCallError,
 } from "../../../utils/errors.ts";
+import { type JwtEndpointVersion } from "../localMember/LocalTransport.ts";
 
 export interface ConnectionOpts {
+  /**
+   * For the local transport we already do know the jwt token and url. We can reuse it.
+   * On top the local transport will send additional data to the jwt server to use delayed event delegation.
+   */
+  existingSFUConfig?: SFUConfig;
+  /**
+   * For local connections that use the oldest member pattern. here we have not prefetched the sfuConfig
+   * and hence we need to let the connection do the jwt token fetching.
+   */
+  forceJwtEndpoint?: JwtEndpointVersion;
+  /** The identity parts to use on this connection */
+  ownMembershipIdentity: CallMembershipIdentityParts;
   /** The media transport to connect to. */
-  transport: LivekitTransport;
+  transport: LivekitTransportConfig;
   /** The Matrix client to use for OpenID and SFU config requests. */
   client: OpenIDClientParts;
+  /** The room ID this connection is associated with. */
+  roomId: string;
   /** The observable scope to use for this connection. */
   scope: ObservableScope;
 
@@ -88,7 +104,7 @@ export class Connection {
   /**
    * The media transport to connect to.
    */
-  public readonly transport: LivekitTransport;
+  public readonly transport: LivekitTransportConfig;
 
   public readonly livekitRoom: LivekitRoom;
 
@@ -104,10 +120,59 @@ export class Connection {
   public readonly remoteParticipants$: Behavior<RemoteParticipant[]>;
 
   /**
+   * The alias of the LiveKit room.
+   */
+  public get livekitAlias(): string | undefined {
+    return this._livekitAlias;
+  }
+  private _livekitAlias?: string;
+
+  /**
    * Whether the connection has been stopped.
    * @see Connection.stop
    * */
   protected stopped = false;
+
+  // TODO: can we just keep the ConnectionOpts object instead of spreading?
+  private readonly client: OpenIDClientParts;
+  private readonly roomId: string;
+  private readonly logger: Logger;
+  private readonly ownMembershipIdentity: CallMembershipIdentityParts;
+  private readonly existingSFUConfig?: SFUConfig;
+  /**
+   * Creates a new connection to a matrix RTC LiveKit backend.
+   *
+   * @param opts - Connection options {@link ConnectionOpts}.
+   *
+   * @param logger - The logger to use.
+   */
+  public constructor(opts: ConnectionOpts, logger: Logger) {
+    this.ownMembershipIdentity = opts.ownMembershipIdentity;
+    this.existingSFUConfig = opts.existingSFUConfig;
+    this.roomId = opts.roomId;
+    this.logger = logger.getChild(
+      "[Connection " + opts.transport.livekit_service_url + "]",
+    );
+    this.logger.info(
+      `constructor: ${opts.transport.livekit_service_url} roomId: ${this.roomId} withSfuConfig?: ${opts.existingSFUConfig ? JSON.stringify(opts.existingSFUConfig) : "undefined"}`,
+    );
+    const { transport, client, scope } = opts;
+
+    this.scope = scope;
+    this.livekitRoom = opts.livekitRoomFactory();
+    this.transport = transport;
+    this.client = client;
+
+    this.remoteParticipants$ = scope.behavior(
+      // Only tracks remote participants
+      connectedParticipantsObserver(this.livekitRoom),
+    );
+
+    scope.onEnd(() => {
+      this.logger.info(`Connection scope ended, stopping connection`);
+      void this.stop();
+    });
+  }
 
   /**
    * Starts the connection.
@@ -129,8 +194,21 @@ export class Connection {
     try {
       this._state$.next(ConnectionState.FetchingConfig);
       // We should already have this information after creating the localTransport.
-      // It would probably be better to forward this here.
-      const { url, jwt } = await this.getSFUConfigWithOpenID();
+      // only call getSFUConfigWithOpenID for connections where we do not have a token yet. (existingJwtTokenData === undefined)
+      const { url, jwt, livekitAlias } =
+        this.existingSFUConfig ??
+        (await this.getSFUConfigForRemoteConnection());
+      this.logger.debug(
+        "Starting Connection to: ",
+        this.transport.livekit_service_url,
+        "jwt: ",
+        jwt,
+        "wss: ",
+        url,
+        "livekitAlias: ",
+        livekitAlias,
+      );
+      this._livekitAlias = livekitAlias;
       // If we were stopped while fetching the config, don't proceed to connect
       if (this.stopped) return;
 
@@ -146,8 +224,11 @@ export class Connection {
         });
 
       try {
+        this.logger.info(`livekitRoom.connect ${url}`);
         await this.livekitRoom.connect(url, jwt);
+        this.logger.info(`livekitRoom.connect SUCCESS ${url}`);
       } catch (e) {
+        this.logger.info(`livekitRoom.connect FAILED ${url}`, e);
         // LiveKit uses 503 to indicate that the server has hit its track limits.
         // https://github.com/livekit/livekit/blob/fcb05e97c5a31812ecf0ca6f7efa57c485cea9fb/pkg/service/rtcservice.go#L171
         // It also errors with a status code of 200 (yes, really) for room
@@ -186,11 +267,17 @@ export class Connection {
     }
   }
 
-  protected async getSFUConfigWithOpenID(): Promise<SFUConfig> {
+  protected async getSFUConfigForRemoteConnection(): Promise<SFUConfig> {
+    // This will only be called for sfu's where we do not publish ourselves.
+    // For the local connection we will use the existingJwtTokenData
     return await getSFUConfigWithOpenID(
       this.client,
+      this.ownMembershipIdentity,
       this.transport.livekit_service_url,
-      this.transport.livekit_alias,
+      this.roomId,
+      // dont pass any custom opts for the subscribe only connections
+      {},
+      this.logger,
     );
   }
 
@@ -202,44 +289,14 @@ export class Connection {
    */
   public async stop(): Promise<void> {
     this.logger.debug(
-      `Stopping connection to ${this.transport.livekit_service_url}`,
+      `stop: disconnecing from lk room ${this.transport.livekit_service_url}`,
     );
     if (this.stopped) return;
     await this.livekitRoom.disconnect();
     this._state$.next(ConnectionState.Stopped);
     this.stopped = true;
-  }
-
-  private readonly client: OpenIDClientParts;
-  private readonly logger: Logger;
-
-  /**
-   * Creates a new connection to a matrix RTC LiveKit backend.
-   *
-   * @param opts - Connection options {@link ConnectionOpts}.
-   *
-   * @param logger - The logger to use.
-   */
-  public constructor(opts: ConnectionOpts, logger: Logger) {
-    this.logger = logger.getChild("[Connection]");
-    this.logger.info(
-      `Creating new connection to ${opts.transport.livekit_service_url} ${opts.transport.livekit_alias}`,
+    this.logger.debug(
+      `stop: DONE disconnecing from lk room ${this.transport.livekit_service_url}`,
     );
-    const { transport, client, scope } = opts;
-
-    this.scope = scope;
-    this.livekitRoom = opts.livekitRoomFactory();
-    this.transport = transport;
-    this.client = client;
-
-    this.remoteParticipants$ = scope.behavior(
-      // Only tracks remote participants
-      connectedParticipantsObserver(this.livekitRoom),
-    );
-
-    scope.onEnd(() => {
-      this.logger.info(`Connection scope ended, stopping connection`);
-      void this.stop();
-    });
   }
 }

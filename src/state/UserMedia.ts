@@ -75,6 +75,7 @@ export class UserMedia {
           this.scope,
           this.id,
           this.userId,
+          this.rtcBackendIdentity,
           this.participant.value$,
           this.encryptionSystem,
           this.livekitRoom$,
@@ -89,6 +90,7 @@ export class UserMedia {
           this.scope,
           this.id,
           this.userId,
+          this.rtcBackendIdentity,
           this.participant.value$,
           this.encryptionSystem,
           this.livekitRoom$,
@@ -128,6 +130,7 @@ export class UserMedia {
               // MediaViewModels don't support it though since they look for a unique
               // track for the given source. So generateItems here is a bit overkill.
               generateItems(
+                `${this.id} screenShares$`,
                 function* (p) {
                   if (p.isScreenShareEnabled)
                     yield {
@@ -140,6 +143,7 @@ export class UserMedia {
                     scope,
                     `${this.id}:${key}`,
                     this.userId,
+                    this.rtcBackendIdentity,
                     p,
                     this.encryptionSystem,
                     this.livekitRoom$,
@@ -191,6 +195,7 @@ export class UserMedia {
     private readonly scope: ObservableScope,
     public readonly id: string,
     private readonly userId: string,
+    private readonly rtcBackendIdentity: string,
     private readonly participant: TaggedParticipant,
     private readonly encryptionSystem: EncryptionSystem,
     private readonly livekitRoom$: Behavior<LivekitRoom | undefined>,

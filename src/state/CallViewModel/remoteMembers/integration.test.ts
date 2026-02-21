@@ -10,7 +10,7 @@ import { BehaviorSubject } from "rxjs";
 import { type Room as LivekitRoom } from "livekit-client";
 import EventEmitter from "events";
 import fetchMock from "fetch-mock";
-import { type LivekitTransport } from "matrix-js-sdk/lib/matrixrtc";
+import { type LivekitTransportConfig } from "matrix-js-sdk/lib/matrixrtc";
 import { logger } from "matrix-js-sdk/lib/logger";
 
 import {
@@ -21,8 +21,9 @@ import {
 import { ECConnectionFactory } from "./ConnectionFactory.ts";
 import { type OpenIDClientParts } from "../../../livekit/openIDSFU.ts";
 import {
-  mockCallMembership,
   mockMediaDevices,
+  mockRtcMembership,
+  ownMemberMock,
   withTestScheduler,
 } from "../../../utils/test.ts";
 import { type ProcessorState } from "../../../livekit/TrackProcessorContext.tsx";
@@ -33,6 +34,7 @@ import {
 } from "./MatrixLivekitMembers.ts";
 import { createConnectionManager$ } from "./ConnectionManager.ts";
 import { membershipsAndTransports$ } from "../../SessionBehaviors.ts";
+import { constant } from "../../Behavior.ts";
 import { testJWTToken } from "../../../utils/test-fixtures.ts";
 
 // Test the integration of ConnectionManager and MatrixLivekitMerger
@@ -69,6 +71,7 @@ beforeEach(() => {
 
   ecConnectionFactory = new ECConnectionFactory(
     mockClient,
+    "!roomid:example.org",
     mockMediaDevices({}),
     new BehaviorSubject<ProcessorState>({
       supported: true,
@@ -99,9 +102,9 @@ afterEach(() => {
 
 test("bob, carl, then bob joining no tracks yet", () => {
   withTestScheduler(({ expectObservable, behavior, scope }) => {
-    const bobMembership = mockCallMembership("@bob:example.com", "BDEV000");
-    const carlMembership = mockCallMembership("@carl:example.com", "CDEV000");
-    const daveMembership = mockCallMembership("@dave:foo.bar", "DDEV000");
+    const bobMembership = mockRtcMembership("@bob:example.com", "BDEV000");
+    const carlMembership = mockRtcMembership("@carl:example.com", "CDEV000");
+    const daveMembership = mockRtcMembership("@dave:foo.bar", "DDEV000");
 
     const eMarble = "abc";
     const vMarble = "abc";
@@ -121,8 +124,10 @@ test("bob, carl, then bob joining no tracks yet", () => {
     const connectionManager = createConnectionManager$({
       scope: testScope,
       connectionFactory: ecConnectionFactory,
-      inputTransports$: membershipsAndTransports.transports$,
+      localTransport$: constant(null),
+      remoteTransports$: membershipsAndTransports.transports$,
       logger: logger,
+      ownMembershipIdentity: ownMemberMock,
     });
 
     const matrixLivekitMembers$ = createMatrixLivekitMembers$({
@@ -144,7 +149,7 @@ test("bob, carl, then bob joining no tracks yet", () => {
           a: expect.toSatisfy((co) =>
             areLivekitTransportsEqual(
               co.transport,
-              bobMembership.transports[0]! as LivekitTransport,
+              bobMembership.transports[0]! as LivekitTransportConfig,
             ),
           ),
         });
@@ -181,7 +186,7 @@ test("bob, carl, then bob joining no tracks yet", () => {
               expect(
                 areLivekitTransportsEqual(
                   connection.transport,
-                  carlMembership.transports[0]! as LivekitTransport,
+                  carlMembership.transports[0]! as LivekitTransportConfig,
                 ),
               ).toBe(true);
               return true;
@@ -211,7 +216,7 @@ test("bob, carl, then bob joining no tracks yet", () => {
               expect(
                 areLivekitTransportsEqual(
                   connection.transport,
-                  daveMembership.transports[0]! as LivekitTransport,
+                  daveMembership.transports[0]! as LivekitTransportConfig,
                 ),
               ).toBe(true);
               return true;

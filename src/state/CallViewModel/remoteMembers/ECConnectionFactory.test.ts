@@ -15,7 +15,11 @@ import EventEmitter from "events";
 import { ObservableScope } from "../../ObservableScope.ts";
 import { ECConnectionFactory } from "./ConnectionFactory.ts";
 import type { OpenIDClientParts } from "../../../livekit/openIDSFU.ts";
-import { exampleTransport, mockMediaDevices } from "../../../utils/test.ts";
+import {
+  exampleTransport,
+  mockMediaDevices,
+  ownMemberMock,
+} from "../../../utils/test.ts";
 import type { ProcessorState } from "../../../livekit/TrackProcessorContext.tsx";
 import { constant } from "../../Behavior";
 
@@ -61,6 +65,7 @@ describe("ECConnectionFactory - Audio inputs options", () => {
 
       const ecConnectionFactory = new ECConnectionFactory(
         mockClient,
+        "!roomid:example.org",
         mockMediaDevices({}),
         new BehaviorSubject<ProcessorState>({
           supported: true,
@@ -72,7 +77,12 @@ describe("ECConnectionFactory - Audio inputs options", () => {
         echo,
         noise,
       );
-      ecConnectionFactory.createConnection(exampleTransport, testScope, logger);
+      ecConnectionFactory.createConnection(
+        testScope,
+        exampleTransport,
+        ownMemberMock,
+        logger,
+      );
 
       // Check if Room was constructed with expected options
       expect(RoomConstructor).toHaveBeenCalledWith(
@@ -96,6 +106,7 @@ describe("ECConnectionFactory - ControlledAudioDevice", () => {
 
       const ecConnectionFactory = new ECConnectionFactory(
         mockClient,
+        "!roomid:example.org",
         mockMediaDevices({
           audioOutput: {
             available$: constant(new Map<never, never>()),
@@ -113,7 +124,12 @@ describe("ECConnectionFactory - ControlledAudioDevice", () => {
         false,
         false,
       );
-      ecConnectionFactory.createConnection(exampleTransport, testScope, logger);
+      ecConnectionFactory.createConnection(
+        testScope,
+        exampleTransport,
+        ownMemberMock,
+        logger,
+      );
 
       // Check if Room was constructed with expected options
       expect(RoomConstructor).toHaveBeenCalledWith(

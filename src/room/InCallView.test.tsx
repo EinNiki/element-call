@@ -1,5 +1,6 @@
 /*
 Copyright 2025 New Vector Ltd.
+Copyright 2026 Element Creations Ltd.
 
 SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 Please see LICENSE in the repository root for full details.
@@ -42,7 +43,8 @@ import { useRoomEncryptionSystem } from "../e2ee/sharedKeyManagement";
 import { LivekitRoomAudioRenderer } from "../livekit/MatrixAudioRenderer";
 import { MediaDevicesContext } from "../MediaDevicesContext";
 import { HeaderStyle } from "../UrlParams";
-
+import { initializeWidget } from "../widget";
+initializeWidget();
 vi.hoisted(
   () =>
     (global.ImageData = class MockImageData {
