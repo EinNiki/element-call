@@ -58,6 +58,7 @@ import {
   echoCancellationSetting,
   noiseSuppressionSetting,
   autoGainControlSetting,
+  e2eeSafeCodec,
   type VideoCodec,
   enableExtendedLivekitLogs as enableExtendedLivekitLogsSetting,
 } from "./settings";
@@ -299,13 +300,12 @@ export const DeveloperSettingsTab: FC<Props> = ({
               </label>
               <select
                 id={`${id}Codec`}
-                value={codec}
+                value={e2eeSafeCodec(codec)}
                 onChange={(e): void => setCodec(e.target.value as VideoCodec)}
               >
                 <option value="vp8">VP8</option>
                 <option value="vp9">VP9</option>
                 <option value="h264">H.264</option>
-                <option value="av1">AV1</option>
               </select>
             </div>
           </>

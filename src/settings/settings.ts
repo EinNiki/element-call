@@ -162,6 +162,15 @@ export const customTransport = new Setting<UnstableLivekitTransport | null>(
 export type VideoCodec = "vp8" | "vp9" | "h264" | "av1";
 
 /**
+ * LiveKit's end-to-end encryption can't handle AV1 yet (it throws and the
+ * stream turns black for everyone else), so a stored or configured AV1
+ * falls back to VP9, which is the closest in quality.
+ */
+export function e2eeSafeCodec(codec: VideoCodec): VideoCodec {
+  return codec === "av1" ? "vp9" : codec;
+}
+
+/**
  * Parse a "WIDTHxHEIGHT" resolution string into numeric width and height.
  */
 export function parseResolution(res: string): {

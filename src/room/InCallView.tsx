@@ -81,6 +81,7 @@ import {
   autoGainControlSetting,
   cameraBitrate,
   cameraCodec,
+  e2eeSafeCodec,
   cameraFramerate,
   cameraResolution,
   customTransport,
@@ -750,7 +751,7 @@ export function captureSettings(): CaptureSettings {
         },
         maxBitrate: cameraBitrate.getValue(),
         maxFramerate: cameraFramerate.getValue(),
-        codec: cameraCodec.getValue(),
+        codec: e2eeSafeCodec(cameraCodec.getValue()),
       }
     : undefined;
   const screenConfig = config.media_quality?.screen_share;
@@ -762,7 +763,7 @@ export function captureSettings(): CaptureSettings {
         },
         maxBitrate: screenShareBitrate.getValue(),
         maxFramerate: screenShareFramerate.getValue(),
-        codec: screenShareCodec.getValue(),
+        codec: e2eeSafeCodec(screenShareCodec.getValue()),
       }
     : screenConfig?.max_resolution
       ? {
