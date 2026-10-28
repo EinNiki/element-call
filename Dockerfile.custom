@@ -1,0 +1,17 @@
+# Self-contained build: compiles Element Call from this repo and serves it with nginx.
+FROM node:22-alpine AS build
+RUN corepack enable
+WORKDIR /src
+COPY . .
+RUN yarn install --immutable
+RUN yarn build
+
+FROM alpine AS gz
+COPY --from=build /src/dist /dist
+WORKDIR /dist/assets
+# Pre-compress for nginx gzip_static, same as upstream
+RUN gzip -k ../index.html *.js *.map *.css *.wasm *-app-*.json
+
+FROM nginxinc/nginx-unprivileged:alpine-slim
+COPY --from=gz /dist /app
+COPY --from=build /src/config/nginx.conf /etc/nginx/conf.d/default.conf
